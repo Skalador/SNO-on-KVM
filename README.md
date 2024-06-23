@@ -6,9 +6,14 @@ Single Node OpenShift (SNO) on Kernel-based Virtual Machine (KVM)
 - [Basic installation](#basic-installation)
   - [Obtain tools](#obtain-tools)
   - [Prepare ISO](#prepare-iso)
+  - [Embed the ignition file into the ISO](#embed-the-ignition-file-into-the-iso)
   - [Prepare DNS](#prepare-dns)
   - [Install OpenShift on KVM](#install-openshift-on-kvm)
   - [Remove VM from Host](#remove-vm-from-host)
+- [Advanced configuration options during live boot](#advanced-configuration-options-during-live-boot)
+  - [Prepare HTTP webserver for ignition](#prepare-http-webserver-for-ignition)
+  - [Live boot the coreOS image](#live-boot-the-coreos-image)
+  - [Run the coreos-installer on live boot](#run-the-coreos-installer-on-live-boot)
 
 # Basic installation
 
@@ -83,7 +88,11 @@ sshKey: |
 EOF
 
 openshift-install --dir=sno create single-node-ignition-config
+```
 
+## Embed the ignition file into the ISO
+
+```sh
 coreos-installer iso ignition embed -fi sno/bootstrap-in-place-for-live-iso.ign rhcos-live.iso
 mv $HOME/rhcos-live.iso /var/lib/libvirt/images/
 ```
@@ -126,8 +135,9 @@ virt-install --name="master-sno" \
 # In case you want to follow the installation process on the node
 # The installation process takes around 50 minutes
 virsh domifaddr master-sno
-journalctl -b -f -u release-image.service -u bootkube.service
 ssh core@192.168.122.10
+journalctl -b -f -u release-image.service -u bootkube.service
+
 
 openshift-install --dir=sno wait-for bootstrap-complete --log-level=debug
 openshift-install --dir=sno wait-for install-complete --log-level=debug
@@ -138,10 +148,112 @@ oc get nodes
 ## Remove VM from Host
 
 ```sh
+# Stop the domain gracefully
+virsh shutdown master-sno
+
 # Remove VM without storage
 virsh undefine master-sno
 
 # Remove VM and storage
 virsh undefine master-sno --remove-all-storage
+
+Domain 'master-sno' has been undefined
+Volume 'sda'(/var/lib/libvirt/images/master-sno.qcow2) removed.
 ```
 
+# Advanced configuration options during live boot
+
+**This chapter is work in progress.**
+The goal is to use advanced configuration options such as [multipath](https://docs.openshift.com/container-platform/4.15/installing/installing_bare_metal/installing-bare-metal.html#rhcos-enabling-multipath_installing-bare-metal). We could take a shortcut by leveraging the `--extra-args` option of during `virt-install` similar to the [SNO installation on IBM Z](https://docs.openshift.com/container-platform/4.15/installing/installing_sno/install-sno-installing-sno.html#installing-sno-on-ibm-z-kvm_install-sno-installing-sno-with-the-assisted-installer), but that is not the goal of the exercise. 
+
+As most of the steps are similar, I will assume that the following chapters from above are already completed:
+- [Obtain tools](#obtain-tools)
+- [Prepare ISO](#prepare-iso)
+- [Prepare DNS](#prepare-dns)
+
+## Prepare HTTP webserver for ignition
+
+```sh
+dnf install -y httpd
+systemctl start httpd
+cp sno/bootstrap-in-place-for-live-iso.ign /var/www/html/
+chmod +r /var/www/html/bootstrap-in-place-for-live-iso.ign
+```
+
+## Live boot the coreOS image
+
+Instead of [embedding the ignition file into the ISO from the previous chapter](#embed-the-ignition-file-into-the-iso) we will boot the standard ISO and modify it during live boot.
+
+```sh
+tree sno/
+sno/
+├── auth
+│   ├── kubeadmin-password
+│   └── kubeconfig
+├── bootstrap-in-place-for-live-iso.ign
+├── metadata.json
+└── worker.ign
+
+1 directory, 5 files
+
+cp $HOME/rhcos-live.iso /var/lib/libvirt/images/
+
+# In case this was not completed before
+virsh net-update default add ip-dhcp-host "<host mac='52:54:00:65:aa:da' name='master.sno.local' ip='192.168.122.10'/>" --live --config
+
+virt-install --name="master-sno-live" \
+    --vcpus=4 \
+    --ram=32768 \
+    --disk path=/var/lib/libvirt/images/master-sno-live.qcow2,bus=sata,size=120 \
+    --network network=default,model=virtio \
+    -m 52:54:00:65:aa:da \
+    --boot menu=on \
+    --graphics vnc --console pty,target_type=serial --noautoconsole \
+    --cpu host-passthrough \
+    --cdrom /var/lib/libvirt/images/rhcos-live.iso \
+    --os-variant=rhel9.2
+```
+
+## Run the coreos-installer on live boot
+
+As the live boot does not have an IP available, you have to connect to the server differently. One approach would be to use `virt-viewer` and connect to the KVM server from externally. This allows you to enable the serial console on the guest/domain/VM.
+```sh
+virt-viewer --connect qemu+ssh://<username>@<serverIP>/system master-sno-live
+sudo systemctl start serial-getty@ttyS0.service
+```
+
+After enabling the serial console, you can connect from the KVM host.
+```sh
+virsh console master-sno-live
+```
+
+Test if you can download the ignition from the host.
+```sh
+curl http://192.168.122.1:80/bootstrap-in-place-for-live-iso.ign -o bootstrap.ign
+```
+
+Run the `coreos-installer` with optional advanced configuration via `--append-karg`.
+
+```sh
+sudo coreos-installer install --ignition-url=http://192.168.122.1:80/bootstrap-in-place-for-live-iso.ign --insecure-ignition /dev/sda
+> Read disk 3.6 GiB/3.6 GiB (100%)     
+Writing Ignition config
+Install complete.
+
+sudo reboot
+
+virsh start master-sno-live
+ssh core@192.168.122.10
+journalctl -b -f -u release-image.service -u bootkube.service
+
+openshift-install --dir=sno wait-for bootstrap-complete --log-level=debug
+openshift-install --dir=sno wait-for install-complete --log-level=debug
+export KUBECONFIG=sno/auth/kubeconfig
+oc get nodes
+```
+
+Stop the `httpd` server on the host and remove the ignition file.
+```sh
+systemctl stop httpd
+rm /var/www/html/bootstrap-in-place-for-live-iso.ign
+```
